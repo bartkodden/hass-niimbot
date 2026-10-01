@@ -19,6 +19,7 @@ from .model import (
     consumable_type_name,
     default_label_type_code,
     get_printer_meta_by_id,
+    get_printer_meta_by_model,
     get_supported_label_type_codes,
     material_name,
     rfid_supported_on_firmware,
@@ -29,6 +30,9 @@ from .model import (
     supports_print_test_page,
     supports_ribbon_rfid,
 )
+
+# BLE name prefixes that identify AiYin D11s devices (FICHERO, D11s_)
+_AIYIN_NAME_PREFIXES = ("FICHERO", "D11s_")
 from .printer import InfoEnum, PrinterClient, PrinterError, PrinterTimeout, SoundEnum
 
 
@@ -434,6 +438,18 @@ class NiimbotDevice:
         self._open_session = session
         same_link = client is self.client and self._printer is not None
         self.client = client
+
+        # Detect AiYin/FICHERO by BLE name and pre-set the model so
+        # print_image routes to print_image_aiyin without GET_INFO.
+        dev_name = getattr(ble_device, "name", None) or ""
+        if any(dev_name.startswith(p) for p in _AIYIN_NAME_PREFIXES):
+            if not self.model:
+                self.model = PrinterModel.FICHERO_D11S.name
+                self.ble_data.model = self.model
+                meta = get_printer_meta_by_model(PrinterModel.FICHERO_D11S)
+                if meta:
+                    self.ble_data.sensors.setdefault("density", meta.get("densityDefault", 1))
+                _LOGGER.debug("Detected AiYin/FICHERO printer by name %r, model set to FICHERO_D11S", dev_name)
         if trace is not None and trace.link is not None:
             self._link = trace.link
         if same_link:
@@ -770,8 +786,80 @@ class NiimbotDevice:
             _LOGGER.debug("Obtained BLEData: %s", self.ble_data)
             return self.ble_data
 
+
+    async def _read_aiyin_state(self, printer: PrinterClient) -> None:
+        """Read AiYin D11s / FICHERO state using native commands."""
+        _LOGGER.debug("Reading AiYin/FICHERO device state")
+
+        # Get all info in one call
+        info = await printer.get_aiyin_all_info()
+        if info:
+            if info.get("firmware") and not self.ble_data.sw_version:
+                self.ble_data.sw_version = info["firmware"]
+            if info.get("serial") and not self.ble_data.serial_number:
+                self.ble_data.serial_number = info["serial"]
+
+        # Battery
+        battery = await printer.get_aiyin_battery()
+        if battery is not None:
+            self.ble_data.sensors["battery"] = max(0, min(100, battery))
+
+        # Status byte
+        # AiYin status bitmask (from docs/PROTOCOL.md):
+        #   bit0=printing  bit1=cover_open  bit2=no_paper
+        #   bit3=low_batt  bit4/6=overheat  bit5=charging
+        # Niimbot convention: closingstate=0 → closed, 1 → open
+        #                     paperstate=1 → loaded, 0 → empty
+        status_byte = await printer.get_aiyin_status()
+        _LOGGER.debug("AiYin raw status byte: %s", hex(status_byte) if status_byte is not None else "None")
+        if status_byte is not None:
+            # bit1: cover_open flag → 1=open, 0=closed
+            self.ble_data.sensors["closingstate"] = 1 if (status_byte & 0x02) else 0
+            # bit2: no_paper flag → 1=empty, 0=loaded (inverted for paperstate)
+            self.ble_data.sensors["paperstate"] = 0 if (status_byte & 0x04) else 1
+            # bit3: low battery
+            if status_byte & 0x08:
+                _LOGGER.debug("AiYin low battery flag set")
+            _LOGGER.debug(
+                "AiYin status: cover=%s paper=%s printing=%s charging=%s",
+                "open" if (status_byte & 0x02) else "closed",
+                "empty" if (status_byte & 0x04) else "loaded",
+                bool(status_byte & 0x01),
+                bool(status_byte & 0x20),
+            )
+        else:
+            # Default to safe values if read fails
+            self.ble_data.sensors["closingstate"] = 0  # assume closed
+            self.ble_data.sensors["paperstate"] = 1    # assume loaded
+
+        # Density — AiYin returns internal value (e.g. 20 = medium)
+        # Map to niimbot display range 0-2: 0=light, 1=medium, 2=dark
+        raw_density = await printer.get_aiyin_density()
+        if raw_density is not None:
+            _LOGGER.debug("AiYin raw density: %d", raw_density)
+            # Internal values observed: ~10=light, ~20=medium, ~30=dark
+            # Map proportionally to 0-2 display range
+            if raw_density <= 12:
+                mapped = 0
+            elif raw_density <= 22:
+                mapped = 1
+            else:
+                mapped = 2
+            self.ble_data.density = mapped
+            self.ble_data.sensors["density"] = mapped
+
+        # Set label type to WithGaps (1) — D11s default
+        self.ble_data.labeltype = 1
+        self.ble_data.sensors["labeltype"] = "WithGaps"
+
     async def _read_device_state(self, printer: PrinterClient) -> None:
         """Read identity, settings, heartbeat and RFID while a session is open."""
+
+        # AiYin/FICHERO D11s uses different info commands
+        if self.model == "FICHERO_D11S":
+            await self._read_aiyin_state(printer)
+            return
+
         if not self.ble_data.serial_number:
             self.ble_data.serial_number = str(
                 await printer.get_info(InfoEnum.DEVICESERIAL)
@@ -942,6 +1030,7 @@ class NiimbotDevice:
         copies: int = 1,
     ) -> dict:
         async with self.lock:
+
             self._is_printing = True
             self._print_start_time = time.time()
             self._print_end_time = None

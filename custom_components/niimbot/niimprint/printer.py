@@ -338,6 +338,91 @@ class PrinterClient:
     async def stop_notify(self):
         await self._transport.stop_notify(CHARACTERISTIC_UUID)
 
+    async def connect(self) -> bool:
+        """Send the application-layer Connect handshake (0xC1 with 0x03 prefix).
+
+        Some OEM Niimbot-compatible printers (e.g. FICHERO) require this before
+        accepting any other command. The 0x03 prefix is unique to this packet:
+            03 55 55 C1 01 01 C1 AA AA
+        Standard Niimbot printers ignore it harmlessly.
+        """
+        _LOGGER.debug("Sending Connect packet (0xC1)")
+        # Hand-built: 0x03 prefix + framed packet (55 55 C1 01 01 BCC AA AA)
+        # BCC = C1 ^ 01 ^ 01 = C1
+        packet_bytes = bytes([0x03, 0x55, 0x55, 0xC1, 0x01, 0x01, 0xC1, 0xAA, 0xAA])
+        try:
+            await self._transport.write(packet_bytes, response=False)
+            await sleep(0.3)
+            packets = await self._recv(timeout=1.5)
+            for packet in packets:
+                if packet.type == 0xC2:
+                    _LOGGER.debug("Connect acknowledged: %s", packet.data.hex())
+                    return True
+            _LOGGER.debug("No Connect (0xC2) response — continuing anyway")
+            return False
+        except Exception as err:
+            _LOGGER.debug("Connect packet failed (non-fatal): %s", err)
+            return False
+
+
+    async def get_aiyin_battery(self) -> int | None:
+        """AiYin: 10 FF 50 F1 -> [status, percent]"""
+        try:
+            await self._transport.write(bytes([0x10, 0xFF, 0x50, 0xF1]))
+            raw = await self._transport.read(32, timeout=3.0)
+            if raw and len(raw) >= 2:
+                return raw[-1]  # last byte is percentage
+        except Exception as err:
+            _LOGGER.debug("AiYin battery read failed: %s", err)
+        return None
+
+    async def get_aiyin_status(self) -> int | None:
+        """AiYin: 10 FF 40 -> 1 byte bitmask
+        bit0=printing, bit1=cover_open, bit2=no_paper,
+        bit3=low_battery, bit4/6=overheat, bit5=charging
+        """
+        try:
+            await self._transport.write(bytes([0x10, 0xFF, 0x40]))
+            raw = await self._transport.read(32, timeout=3.0)
+            if raw:
+                return raw[-1]
+        except Exception as err:
+            _LOGGER.debug("AiYin status read failed: %s", err)
+        return None
+
+    async def get_aiyin_density(self) -> int | None:
+        """AiYin: 10 FF 11 -> 3 bytes, middle byte is density"""
+        try:
+            await self._transport.write(bytes([0x10, 0xFF, 0x11]))
+            raw = await self._transport.read(32, timeout=3.0)
+            if raw and len(raw) >= 2:
+                return raw[1]
+        except Exception as err:
+            _LOGGER.debug("AiYin density read failed: %s", err)
+        return None
+
+    async def get_aiyin_all_info(self) -> dict:
+        """AiYin: 10 FF 70 -> pipe-delimited: BT_NAME|MAC_BT|MAC_BLE|FW|SERIAL|BATTERY"""
+        try:
+            await self._transport.write(bytes([0x10, 0xFF, 0x70]))
+            raw = await self._transport.read(128, timeout=3.0)
+            if raw:
+                text = raw.decode("utf-8", errors="replace").strip()
+                parts = text.split("|")
+                if len(parts) >= 5:
+                    return {
+                        "bt_name": parts[0],
+                        "mac_bt": parts[1],
+                        "mac_ble": parts[2],
+                        "firmware": parts[3],
+                        "serial": parts[4],
+                        "battery_str": parts[5] if len(parts) > 5 else None,
+                    }
+        except Exception as err:
+            _LOGGER.debug("AiYin all_info read failed: %s", err)
+        return {}
+
+
     async def print_image(
         self,
         model: PrinterModel,
@@ -357,6 +442,16 @@ class PrinterClient:
         try:
             if copies < 1:
                 raise ValueError(f"copies must be >= 1, got {copies}")
+            # FICHERO D11s / AiYin direct bypass — skip Niimbot framing entirely
+            if model == PrinterModel.FICHERO_D11S:
+                return await self.print_image_aiyin(
+                    image=image,
+                    density=max(0, min(2, density)),
+                    wait_between_print_lines=wait_between_print_lines,
+                    print_line_batch_size=print_line_batch_size,
+                    printhead_pixels=96,
+                    copies=copies,
+                )
             meta = get_printer_meta_by_model(model)
             supported_types = get_supported_label_type_codes(meta)
             if label_type is None:
@@ -397,7 +492,16 @@ class PrinterClient:
                     generation.value,
                 )
 
-            if generation == PrintGeneration.OLD_D11:
+            if generation == PrintGeneration.AIYIN:
+                return await self.print_image_aiyin(
+                    image=image,
+                    density=density,
+                    wait_between_print_lines=wait_between_print_lines,
+                    print_line_batch_size=print_line_batch_size,
+                    printhead_pixels=printhead_pixels or 96,
+                    copies=copies,
+                )
+            elif generation == PrintGeneration.OLD_D11:
                 return await self.print_image_old_d11(**kwargs)
             elif generation == PrintGeneration.D110:
                 return await self.print_image_d110(**kwargs)
@@ -422,6 +526,125 @@ class PrinterClient:
                 )
             else:
                 _LOGGER.debug("Print of page took %.2f s (no row timings)", time.time() - start)
+
+    async def print_image_aiyin(
+        self,
+        image: Image.Image,
+        density: int = 1,
+        wait_between_print_lines: float = 0.0,
+        print_line_batch_size: int = 1,
+        printhead_pixels: int = 96,
+        copies: int = 1,
+    ):
+        """Print on AiYin D11s / FICHERO using raw ESC/POS commands.
+
+        Protocol reference: https://github.com/0xMH/fichero-printer/blob/main/docs/PROTOCOL.md
+        The printer uses raw bytes — NO Niimbot framing (55 55 ... AA AA).
+
+        Print sequence (verified on D11s fw 2.4.6):
+          1. 10 FF 10 00 nn   Set density (0=light, 1=medium, 2=thick)
+          2. 10 FF 84 00       Set paper type gap
+          3. 00 x12            Wakeup (12 null bytes)
+          4. 10 FF FE 01       Enable (AiYin-specific — NOT 10 FF F1 03!)
+          5. 1D 76 30 00 0C 00 yL yH + pixels   GS v 0 raster
+          6. 1D 0C             Form feed
+          7. 10 FF FE 45       Stop — wait for 0xAA or b"OK"
+        """
+        import math
+        from PIL import ImageOps
+        _LOGGER.debug("print_image_aiyin: density=%s copies=%s", density, copies)
+
+        # Clamp density to 0-2
+        density = max(0, min(2, density))
+
+        # Convert image to 1-bit MSB-first, same orientation as other methods
+        img = ImageOps.invert(image.convert("L")).convert("1")
+
+        # Always 96px printhead = 12 bytes per row
+        BYTES_PER_ROW = 12
+        PRINTHEAD_PX = 96
+        height = img.height
+        img_width = min(img.width, PRINTHEAD_PX)
+
+        _LOGGER.debug(
+            "AiYin raster: image=%dx%d effective_width=%d height=%d",
+            img.width, img.height, img_width, height
+        )
+
+        # Build raster: each row is exactly 12 bytes, MSB-first
+        # 1 = black (heater on), 0 = white
+        raster = bytearray()
+        for y in range(height):
+            row_bytes = bytearray(BYTES_PER_ROW)
+            for x in range(img_width):
+                if img.getpixel((x, y)):
+                    row_bytes[x // 8] |= (1 << (7 - (x % 8)))
+            raster.extend(row_bytes)
+
+        yL = height & 0xFF
+        yH = (height >> 8) & 0xFF
+        raster_header = bytes([0x1D, 0x76, 0x30, 0x00, 0x0C, 0x00, yL, yH])
+
+        for copy_num in range(copies):
+            _LOGGER.debug("AiYin print copy %d/%d", copy_num + 1, copies)
+
+            # Step 1: Set density
+            await self._transport.write(bytes([0x10, 0xFF, 0x10, 0x00, density]))
+            await sleep(0.10)
+
+            # Step 2: Set paper type gap
+            await self._transport.write(bytes([0x10, 0xFF, 0x84, 0x00]))
+            await sleep(0.05)
+
+            # Step 3: Wakeup
+            await self._transport.write(bytes(12))
+            await sleep(0.05)
+
+            # Step 4: Enable (AiYin-specific!)
+            await self._transport.write(bytes([0x10, 0xFF, 0xFE, 0x01]))
+            await sleep(0.05)
+
+            # Step 5: Raster header + pixel data (chunked for BLE MTU)
+            chunk_size = 200
+            full_data = raster_header + bytes(raster)
+            for i in range(0, len(full_data), chunk_size):
+                chunk = full_data[i:i + chunk_size]
+                await self._transport.write(chunk, response=False)
+                await sleep(0.02)
+                if self.on_progress:
+                    self.on_progress({
+                        "progress": min(99, int((i / len(full_data)) * 99)),
+                        "page": copy_num + 1,
+                        "page_print_progress": min(99, int((i / len(full_data)) * 99)),
+                        "page_feed_progress": 0,
+                    })
+            await sleep(0.50)
+
+            # Step 6: Form feed
+            await self._transport.write(bytes([0x1D, 0x0C]))
+            await sleep(0.30)
+
+            # Step 7: Stop — wait up to 60s for 0xAA or "OK"
+            self._packetbuf.clear()
+            await self._transport.write(bytes([0x10, 0xFF, 0xFE, 0x45]))
+            try:
+                raw = await self._transport.read(32, timeout=60.0)
+                if raw and (raw[0] == 0xAA or raw.startswith(b"OK")):
+                    _LOGGER.debug("AiYin stop acknowledged: %s", raw.hex())
+                else:
+                    _LOGGER.debug("AiYin stop response: %s", raw.hex() if raw else "empty")
+            except Exception as err:
+                _LOGGER.debug("AiYin stop wait error (non-fatal): %s", err)
+
+            if self.on_progress:
+                self.on_progress({
+                    "progress": 100,
+                    "page": copy_num + 1,
+                    "page_print_progress": 100,
+                    "page_feed_progress": 100,
+                })
+
+        return {"status": "ok"}
 
     async def print_image_old_d11(
         self,
@@ -1119,8 +1342,12 @@ class PrinterClient:
         _LOGGER.debug("Set label type %s", n)
         if not 1 <= n <= 11:
             raise ValueError(f"Label type {n} out of range 1-11")
-        packet = await self._transceive(RequestCodeEnum.SET_LABEL_TYPE, bytes((n,)), 16)
-        return bool(packet.data[0])
+        try:
+            packet = await self._transceive(RequestCodeEnum.SET_LABEL_TYPE, bytes((n,)), 16)
+            return bool(packet.data[0])
+        except (PrinterTimeout, PrinterCommandUnsupported) as err:
+            _LOGGER.warning("set_label_type(%s) not supported, skipping: %s", n, err)
+            return True
 
     async def set_label_density(self, n, density_min: int = 1, density_max: int = 5):
         if not density_min <= n <= density_max:
@@ -1128,10 +1355,14 @@ class PrinterClient:
                 f"Label density {n} out of range {density_min}-{density_max}"
             )
         _LOGGER.debug("Set label density %s", n)
-        packet = await self._transceive(
-            RequestCodeEnum.SET_LABEL_DENSITY, bytes((n,)), 16
-        )
-        return bool(packet.data[0])
+        try:
+            packet = await self._transceive(
+                RequestCodeEnum.SET_LABEL_DENSITY, bytes((n,)), 16
+            )
+            return bool(packet.data[0])
+        except (PrinterTimeout, PrinterCommandUnsupported) as err:
+            _LOGGER.warning("set_label_density(%s) not supported, skipping: %s", n, err)
+            return True
 
     async def start_print(self):
         packet = await self._transceive(RequestCodeEnum.START_PRINT, b"\x01")
@@ -1253,17 +1484,21 @@ class PrinterClient:
 
     async def set_auto_shutdown_time(self, index: int) -> bool:
         if not 1 <= index <= 4:
-            raise ValueError(f"Auto shutdown index {index} out of range 1-4")
+            _LOGGER.warning("Auto shutdown index %s out of range, skipping", index)
+            return False
         try:
             packet = await self._transceive(
                 RequestCodeEnum.SET_AUTO_SHUTDOWN_TIME,
                 bytes((index,)),
                 16,
             )
+            return bool(packet.data[0]) if packet.data else False
         except (PrinterTimeout, PrinterCommandUnsupported) as err:
-            _LOGGER.debug("set_auto_shutdown_time(%s) failed: %s", index, err)
+            _LOGGER.warning("set_auto_shutdown_time(%s) not supported, skipping: %s", index, err)
             return False
-        return bool(packet.data[0]) if packet.data else False
+        except Exception as err:
+            _LOGGER.warning("set_auto_shutdown_time(%s) rejected: %s", index, err)
+            return False
 
     async def get_print_status(self, await_for_response=True):
         _LOGGER.debug("Get print status")

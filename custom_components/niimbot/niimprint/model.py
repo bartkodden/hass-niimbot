@@ -7,6 +7,7 @@ class PrintGeneration(Enum):
     D110 = "D110"
     V4 = "V4"
     V5 = "V5"
+    AIYIN = "AIYIN"   # AiYin D11s / FICHERO raw ESC/POS protocol
 
 class PrintDirection(Enum):
     TOP = "top"
@@ -110,6 +111,7 @@ class PrinterModel(Enum):
     B4_PRO = "B4_PRO"
     K4 = "K4"
     A1_PRO = "A1_PRO"
+    FICHERO_D11S = "FICHERO_D11S"   # AiYin D11s sold as Fichero by Action stores
 
 class PrinterModelMeta(TypedDict):
     model: PrinterModel
@@ -853,6 +855,20 @@ modelsLibrary: list[PrinterModelMeta] = [
         "printheadPixels": 178,
         "paperTypes": [LabelType.PERFORATED, LabelType.CONTINUOUS],
         "printheadPixelsEstimated": True,
+    },
+    {
+        # AiYin D11s sold as Fichero by Action stores. 96px printhead, 14x30mm labels.
+        # Uses raw ESC/POS (NOT Niimbot framing). Detected by BLE name, not GET_INFO.
+        "model": PrinterModel.FICHERO_D11S,
+        "generation": PrintGeneration.AIYIN,
+        "id": [],
+        "dpi": 203,
+        "printDirection": PrintDirection.LEFT,
+        "printheadPixels": 96,
+        "paperTypes": [LabelType.WITH_GAPS, LabelType.CONTINUOUS],
+        "densityMin": 0,
+        "densityMax": 2,
+        "densityDefault": 1,
     },
 ]
 

@@ -104,6 +104,7 @@ NIIMBOT_NAME_PREFIXES = (
     "N1-",
     "T2S",
     "NIIMBOT",
+    "FICHERO",
 )
 
 
